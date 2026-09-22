@@ -146,42 +146,76 @@ def find_session_db(conversation_id, base_dirs):
             return p
     return None
 
-def find_subagents_for_session(conversation_id, base_dirs):
-    """Scan transcript and correlate time-window for any invoke_subagent conversation IDs."""
-    subagent_ids = []
-    min_time = None
-    max_time = None
-
-    # Step 1: Scan transcript for explicit mentions and record session time bounds
+def extract_role_from_transcript(sid, base_dirs):
     for b in base_dirs:
-        transcript_path = os.path.join(b, "brain", conversation_id, ".system_generated", "logs", "transcript.jsonl")
+        transcript_path = os.path.join(b, "brain", sid, ".system_generated", "logs", "transcript.jsonl")
         if os.path.exists(transcript_path):
             try:
+                import re
                 with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
+                    for i, line in enumerate(f):
+                        if i > 10:
+                            break
                         try:
                             obj = json.loads(line)
-                            ts = obj.get("created_at")
-                            if ts:
-                                clean = ts.rstrip("Z").split(".")[0]
-                                dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
-                                t_val = dt.timestamp()
-                                if min_time is None or t_val < min_time:
-                                    min_time = t_val
-                                if max_time is None or t_val > max_time:
-                                    max_time = t_val
+                            c = obj.get("content", "")
+                            if "Implementation Supervisor" in c or "Execute strict-goal implement" in c:
+                                return "sg-implementer (Supervisor)"
+                            elif "Implement Task T" in c:
+                                m = re.search(r'Implement Task (T\d{3})', c)
+                                if m:
+                                    return f"sg-worker ({m.group(1)})"
+                            elif "sg-verifier" in c:
+                                if "Round 2" in c or "round 2" in c:
+                                    return "sg-verifier (Round 2)"
+                                return "sg-verifier"
                         except Exception:
                             pass
-
-                        if any(k in line for k in ("conversationId", "conversation_id", "subagent_session_id", "invoke_subagent")):
-                            import re
-                            uuids = re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', line, re.IGNORECASE)
-                            for u in uuids:
-                                u_lower = u.lower()
-                                if u_lower != conversation_id.lower() and u_lower not in subagent_ids:
-                                    subagent_ids.append(u_lower)
             except Exception:
                 pass
+    return "Subagent"
+
+def find_subagents_for_session(conversation_id, base_dirs):
+    """Scan transcripts recursively and correlate time-window for any invoke_subagent conversation IDs."""
+    subagent_ids = []
+    queue = [conversation_id.lower()]
+    visited = set([conversation_id.lower()])
+    min_time = None
+    max_time = None
+    import re
+
+    while queue:
+        curr = queue.pop(0)
+        for b in base_dirs:
+            transcript_path = os.path.join(b, "brain", curr, ".system_generated", "logs", "transcript.jsonl")
+            if os.path.exists(transcript_path):
+                try:
+                    with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            try:
+                                obj = json.loads(line)
+                                ts = obj.get("created_at")
+                                if ts:
+                                    clean = ts.rstrip("Z").split(".")[0]
+                                    dt = datetime.strptime(clean, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                                    t_val = dt.timestamp()
+                                    if min_time is None or t_val < min_time:
+                                        min_time = t_val
+                                    if max_time is None or t_val > max_time:
+                                        max_time = t_val
+                            except Exception:
+                                pass
+
+                            if any(k in line for k in ("conversationId", "conversation_id", "subagent_session_id", "invoke_subagent")):
+                                uuids = re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', line, re.IGNORECASE)
+                                for u in uuids:
+                                    u_lower = u.lower()
+                                    if u_lower not in visited:
+                                        visited.add(u_lower)
+                                        subagent_ids.append(u_lower)
+                                        queue.append(u_lower)
+                except Exception:
+                    pass
 
     # Step 2: Time-window based discovery in CLI conversations directory
     if min_time is not None and max_time is not None:
@@ -190,12 +224,13 @@ def find_subagents_for_session(conversation_id, base_dirs):
             if os.path.isdir(cli_conv_dir) and "cli" in b:
                 for db_file in glob.glob(os.path.join(cli_conv_dir, "*.db")):
                     cid = os.path.splitext(os.path.basename(db_file))[0].lower()
-                    if cid == conversation_id.lower() or cid in subagent_ids:
+                    if cid in visited:
                         continue
                     try:
                         mtime = os.path.getmtime(db_file)
                         # buffer 30s before min_time and 30s after max_time
                         if (min_time - 30) <= mtime <= (max_time + 30):
+                            visited.add(cid)
                             subagent_ids.append(cid)
                     except Exception:
                         pass
@@ -215,6 +250,7 @@ def main():
 
     home = os.path.expanduser("~")
     base_dirs = [
+        os.path.join(home, ".gemini", "antigravity"),
         os.path.join(home, ".gemini", "antigravity-ide"),
         os.path.join(home, ".gemini", "antigravity-cli"),
     ]
@@ -246,6 +282,7 @@ def main():
             s_parsed = parse_session_db(sdb)
             if s_parsed and s_parsed["steps_count"] > 0:
                 s_parsed["conversation_id"] = sid
+                s_parsed["role"] = extract_role_from_transcript(sid, base_dirs)
                 subagent_stats.append(s_parsed)
 
     combined_cached = parent_stats["cached_tokens"] + sum(s["cached_tokens"] for s in subagent_stats)
@@ -293,7 +330,8 @@ def main():
         print("|---|---|---|---|---|---|---|")
         print(f"| `{target_id[:8]}...` | **Parent (親)** | {parent_stats['steps_count']} | {parent_stats['cached_tokens']:,} | {parent_stats['uncached_input_tokens']:,} | {parent_stats['output_tokens']:,} | **{parent_stats['total_billed_tokens']:,}** |")
         for s in subagent_stats:
-            print(f"| `{s['conversation_id'][:8]}...` | Subagent | {s['steps_count']} | {s['cached_tokens']:,} | {s['uncached_input_tokens']:,} | {s['output_tokens']:,} | **{s['total_billed_tokens']:,}** |")
+            role_str = s.get("role", "Subagent")
+            print(f"| `{s['conversation_id'][:8]}...` | {role_str} | {s['steps_count']} | {s['cached_tokens']:,} | {s['uncached_input_tokens']:,} | {s['output_tokens']:,} | **{s['total_billed_tokens']:,}** |")
 
 if __name__ == "__main__":
     main()
